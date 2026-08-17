@@ -2,15 +2,20 @@
 import argparse
 import json
 import os
-import struct
 import sys
 import time
 
-import numpy as np
-
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from checkpoint_io import read_checkpoint, TensorDict
+from checkpoint_io import (
+    float32_array_to_tensor,
+    get_by_typed_path,
+    load_pt_checkpoint,
+    save_pt_checkpoint,
+    set_by_typed_path,
+    tensor_to_float32_array,
+    uint8_tensor_to_bytes,
+)
 import tensor_compress as tc
 
 
@@ -20,107 +25,251 @@ def _deserialize_chunks(data):
     return pickle.loads(data)
 
 
-def load_alc_file(alc_path):
-    """Load a single .alc compressed tensor file.
-
-    Returns (name, shape, dtype, n_elems, strategy, chunks).
-    """
-    with open(alc_path, "rb") as fh:
-        header_len = struct.unpack("<I", fh.read(4))[0]
-        header = json.loads(fh.read(header_len).decode("utf-8"))
-        chunk_bytes = fh.read()
-
-    strategy_dict = header["strategy"]
-    strategy = tc.CompressStrategy(
+def _strategy_from_dict(strategy_dict):
+    return tc.CompressStrategy(
         path=strategy_dict["path"],
         encoding=strategy_dict.get("encoding", "TANS"),
         ent_ialign=strategy_dict.get("ent_ialign", 0),
         ent_pcdelta=strategy_dict.get("ent_pcdelta", 0),
         ent_rotdelta=strategy_dict.get("ent_rotdelta", 0),
     )
-    chunks = _deserialize_chunks(chunk_bytes)
-
-    return (
-        header["name"],
-        tuple(header["shape"]),
-        header["dtype"],
-        header["n_elems"],
-        strategy,
-        chunks,
-    )
 
 
-def decompress_alc_files(input_dir, base_tensors=None, verbose=True):
-    """Decompress all .alc files in a directory tree.
+def _default_restored_path(input_path, output_dir):
+    filename = os.path.basename(input_path)
+    if filename.startswith("compressed_"):
+        filename = filename[len("compressed_"):]
+    return os.path.join(output_dir, "restored_" + filename)
 
-    Args:
-        input_dir: Directory containing .alc files (searched recursively).
-        base_tensors: Optional TensorDict of base tensors for delta decompression.
-        verbose: Print per-tensor results.
 
-    Returns:
-        TensorDict of reconstructed float32 tensors.
-    """
-    alc_files = []
-    for root, dirs, files in os.walk(input_dir):
-        for fname in sorted(files):
-            if fname.endswith(".alc"):
-                alc_files.append(os.path.join(root, fname))
+def _add_timing(timings, key, seconds):
+    timings[key] = timings.get(key, 0.0) + float(seconds)
 
-    if not alc_files:
-        print("No .alc files found in %s" % input_dir)
-        return TensorDict()
 
-    result = TensorDict()
-    total_dec_time = 0.0
+def _time_call(timings, key, fn, *args, **kwargs):
+    t0 = time.time()
+    value = fn(*args, **kwargs)
+    _add_timing(timings, key, time.time() - t0)
+    return value
+
+
+def _base_array_for_entry(base_state, entry):
+    if base_state is None:
+        return None
+    base_tensor = get_by_typed_path(base_state, entry["path"])
+    base_arr, _ = tensor_to_float32_array(base_tensor)
+    if len(base_arr) != entry["n_elems"]:
+        raise ValueError("base tensor shape does not match compressed tensor: %s" % entry["name"])
+    return base_arr
+
+
+def restore_pt_checkpoint(input_path, metadata_path=None, base_path=None, output_path=None, verbose=True):
+    timings = {"per_tensor": []}
+    total_t0 = time.time()
+
+    if metadata_path is None:
+        metadata_path = input_path + ".json"
+    if output_path is None:
+        output_path = _default_restored_path(input_path, os.path.dirname(os.path.abspath(input_path)))
+
+    t0 = time.time()
+    with open(metadata_path, "r") as fh:
+        metadata = json.load(fh)
+    _add_timing(timings, "metadata_read_seconds", time.time() - t0)
+
+    if metadata.get("format") != "ALC_COMPRESSED_PT_V1":
+        raise ValueError("unsupported metadata format: %s" % metadata.get("format"))
+
+    state = _time_call(timings, "compressed_load_pt_seconds", load_pt_checkpoint, input_path)
+    base_state = None
+    if base_path:
+        base_state = _time_call(timings, "base_load_pt_seconds", load_pt_checkpoint, base_path)
 
     if verbose:
-        header = "%-50s %-20s %8s %9s %3s" % (
-            "Tensor", "Shape", "Path", "Dec MB/s", "OK")
+        header = "%-50s %-20s %8s %9s" % (
+            "Tensor", "Shape", "Path", "Dec MB/s")
         print(header)
-        print("=" * 100)
+        print("=" * 95)
 
-    for alc_path in alc_files:
-        name, shape, dtype_str, n_elems, strategy, chunks = load_alc_file(alc_path)
+    total_dec_time = 0.0
+    restored_count = 0
 
-        # Find base tensor for delta paths
-        base_arr = None
-        if base_tensors is not None and name in base_tensors:
-            base_arr = base_tensors[name]
+    for entry in metadata["tensors"]:
+        tensor_timing = {"name": entry["name"], "path": entry["strategy"]["path"]}
+        tensor_total_t0 = time.time()
 
         t0 = time.time()
-        rec, _ = tc.decompress_tensor(chunks, strategy, n_elems, base_arr)
+        payload_tensor = get_by_typed_path(state, entry["path"])
+        dt = time.time() - t0
+        _add_timing(timings, "payload_lookup_seconds", dt)
+        tensor_timing["payload_lookup_seconds"] = dt
+
+        t0 = time.time()
+        chunk_bytes = uint8_tensor_to_bytes(payload_tensor)
+        dt = time.time() - t0
+        _add_timing(timings, "uint8_tensor_to_bytes_seconds", dt)
+        tensor_timing["uint8_tensor_to_bytes_seconds"] = dt
+
+        t0 = time.time()
+        chunks = _deserialize_chunks(chunk_bytes)
+        dt = time.time() - t0
+        _add_timing(timings, "pickle_deserialize_seconds", dt)
+        tensor_timing["pickle_deserialize_seconds"] = dt
+
+        t0 = time.time()
+        strategy = _strategy_from_dict(entry["strategy"])
+        dt = time.time() - t0
+        _add_timing(timings, "strategy_from_dict_seconds", dt)
+        tensor_timing["strategy_from_dict_seconds"] = dt
+
+        base_arr = None
+        if entry.get("requires_base"):
+            t0 = time.time()
+            base_arr = _base_array_for_entry(base_state, entry)
+            dt = time.time() - t0
+            _add_timing(timings, "base_array_seconds", dt)
+            tensor_timing["base_array_seconds"] = dt
+            if base_arr is None:
+                raise ValueError("base checkpoint is required for tensor: %s" % entry["name"])
+
+        t0 = time.time()
+        rec, _ = tc.decompress_tensor(chunks, strategy, entry["n_elems"], base_arr)
         dec_time = time.time() - t0
+        _add_timing(timings, "codec_decode_seconds", dec_time)
+        tensor_timing["codec_decode_seconds"] = dec_time
         total_dec_time += dec_time
 
-        orig_bytes = n_elems * 4
-        dec_mbs = orig_bytes / dec_time / 1e6 if dec_time > 0 else float("inf")
+        t0 = time.time()
+        restored_tensor = float32_array_to_tensor(rec, entry["dtype"], entry["shape"])
+        dt = time.time() - t0
+        _add_timing(timings, "float32_array_to_tensor_seconds", dt)
+        tensor_timing["float32_array_to_tensor_seconds"] = dt
 
-        # Verify if base was available (re-encode check skipped for speed)
-        ok = True  # assumed correct; full verification requires original data
+        t0 = time.time()
+        state = set_by_typed_path(state, entry["path"], restored_tensor)
+        dt = time.time() - t0
+        _add_timing(timings, "set_by_typed_path_seconds", dt)
+        tensor_timing["set_by_typed_path_seconds"] = dt
 
-        result.add_tensor(name, rec.reshape(shape), dtype_str, shape)
+        restored_count += 1
+        tensor_timing["original_bytes"] = entry["original_bytes"]
+        tensor_timing["total_seconds"] = time.time() - tensor_total_t0
+        timings["per_tensor"].append(tensor_timing)
 
         if verbose:
-            shape_str = str(shape)
-            status = "Y" if ok else "N"
-            print("%-50s %-20s %8s %9.1f %3s" % (
-                name[:50], shape_str[:20], strategy.path, dec_mbs, status))
+            dec_mbs = entry["original_bytes"] / dec_time / 1e6 if dec_time > 0 else float("inf")
+            print("%-50s %-20s %8s %9.1f" % (
+                entry["name"][:50], str(entry["shape"])[:20], strategy.path, dec_mbs))
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    t0 = time.time()
+    save_pt_checkpoint(state, output_path)
+    _add_timing(timings, "save_restored_pt_seconds", time.time() - t0)
+    timings["total_seconds"] = time.time() - total_t0
 
     if verbose:
-        print("=" * 100)
-        print("Tensors: %d, Total decode time: %.1fs" % (len(result), total_dec_time))
+        print("=" * 95)
+        print("Tensors restored: %d, Total decode time: %.1fs" % (restored_count, total_dec_time))
+        print("Saved: %s" % output_path)
 
-    return result
+    return {
+        "output_path": output_path,
+        "restored_count": restored_count,
+        "total_decode_time": total_dec_time,
+        "timings": timings,
+    }
+
+
+def _is_current_metadata(metadata_path):
+    try:
+        with open(metadata_path, "r") as fh:
+            metadata = json.load(fh)
+        return metadata.get("format") == "ALC_COMPRESSED_PT_V1"
+    except (OSError, ValueError):
+        return False
+
+
+def discover_compressed_pt_checkpoints(input_dir):
+    checkpoints = []
+    for root, dirs, files in os.walk(input_dir):
+        for fname in sorted(files):
+            if not (fname.endswith(".pt") or fname.endswith(".pth")):
+                continue
+            path = os.path.join(root, fname)
+            metadata_path = path + ".json"
+            if os.path.exists(metadata_path) and _is_current_metadata(metadata_path):
+                checkpoints.append((path, metadata_path))
+    return checkpoints
+
+
+def _original_filename_from_metadata(input_path, metadata_path):
+    with open(metadata_path, "r") as fh:
+        metadata = json.load(fh)
+    source = metadata.get("source_checkpoint")
+    if source:
+        return os.path.basename(source)
+    filename = os.path.basename(input_path)
+    if filename.startswith("compressed_"):
+        return filename[len("compressed_"):]
+    return filename
+
+
+def find_matching_base(base_dir, original_filename):
+    if base_dir is None:
+        return None
+    candidate = os.path.join(base_dir, original_filename)
+    if os.path.exists(candidate):
+        return candidate
+    for root, dirs, files in os.walk(base_dir):
+        if original_filename in files:
+            return os.path.join(root, original_filename)
+    return None
+
+
+def restore_pt_checkpoints_in_dir(input_dir, base_path=None, base_dir=None, output_dir="./restored_output", verbose=True):
+    checkpoints = discover_compressed_pt_checkpoints(input_dir)
+    if not checkpoints:
+        raise ValueError("no compressed .pt/.pth files with ALC metadata found in %s" % input_dir)
+
+    os.makedirs(output_dir, exist_ok=True)
+    results = []
+    for input_path, metadata_path in checkpoints:
+        original_filename = _original_filename_from_metadata(input_path, metadata_path)
+        file_base_path = base_path or find_matching_base(base_dir, original_filename)
+        output_path = os.path.join(output_dir, "restored_" + original_filename)
+
+        if verbose:
+            print("\n>>> %s" % input_path)
+            if file_base_path:
+                print("  Base: %s" % file_base_path)
+
+        result = restore_pt_checkpoint(
+            input_path,
+            metadata_path=metadata_path,
+            base_path=file_base_path,
+            output_path=output_path,
+            verbose=verbose,
+        )
+        results.append(result)
+
+    return results
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Decompress checkpoint files (.alc format)")
-    parser.add_argument("--input_dir", type=str, required=True,
-                        help="Directory containing .alc files")
+        description="Decompress ALC compressed .pt checkpoints")
+    parser.add_argument("--input", type=str,
+                        help="Compressed .pt checkpoint file")
+    parser.add_argument("--metadata", type=str, default=None,
+                        help="Metadata JSON path (default: <input>.json)")
+    parser.add_argument("--input_dir", type=str,
+                        help="Directory containing compressed .pt/.pth checkpoints")
     parser.add_argument("--base", type=str, default=None,
                         help="Base checkpoint file (for delta decompression)")
+    parser.add_argument("--base_dir", type=str, default=None,
+                        help="Base checkpoint directory (for directory decompression)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Restored .pt output path")
     parser.add_argument("--output_dir", type=str, default="./restored_output",
                         help="Output directory (default: ./restored_output)")
     parser.add_argument("--quiet", action="store_true",
@@ -129,40 +278,31 @@ def main():
 
     verbose = not args.quiet
 
-    # Load base tensors if provided
-    base_tensors = None
-    if args.base:
+    if args.input:
+        output_path = args.output or _default_restored_path(args.input, args.output_dir)
+        restore_pt_checkpoint(
+            args.input,
+            metadata_path=args.metadata,
+            base_path=args.base,
+            output_path=output_path,
+            verbose=verbose,
+        )
+        return
+
+    if args.input_dir:
+        results = restore_pt_checkpoints_in_dir(
+            args.input_dir,
+            base_path=args.base,
+            base_dir=args.base_dir,
+            output_dir=args.output_dir,
+            verbose=verbose,
+        )
         if verbose:
-            print("Loading base: %s" % args.base)
-        base_tensors = read_checkpoint(args.base)
-        if verbose:
-            print("  %d tensors loaded" % len(base_tensors))
+            print("\nRestored files: %d" % len(results))
+            print("Output directory: %s" % args.output_dir)
+        return
 
-    if verbose:
-        print("\nDecompressing from: %s" % args.input_dir)
-
-    restored = decompress_alc_files(args.input_dir, base_tensors, verbose=verbose)
-
-    # Save restored tensors summary
-    os.makedirs(args.output_dir, exist_ok=True)
-    summary = {
-        "tensors": {},
-    }
-    for name in restored:
-        meta = restored.metadata[name]
-        summary["tensors"][name] = {
-            "shape": list(meta["shape"]),
-            "dtype": meta["dtype"],
-            "nbytes": int(restored[name].nbytes),
-        }
-
-    summary_path = os.path.join(args.output_dir, "restore_summary.json")
-    with open(summary_path, "w") as fh:
-        json.dump(summary, fh, indent=2)
-
-    if verbose:
-        print("\nRestored %d tensors to: %s" % (len(restored), args.output_dir))
-        print("Summary: %s" % summary_path)
+    parser.error("Must specify --input or --input_dir")
 
 
 if __name__ == "__main__":

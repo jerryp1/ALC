@@ -4,52 +4,249 @@ import argparse
 import glob
 import json
 import os
-import struct
 import sys
 import time
 
-import numpy as np
-
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from checkpoint_io import read_checkpoint, discover_checkpoints, TensorDict
+from checkpoint_io import (
+    TensorDict,
+    bytes_to_uint8_tensor,
+    discover_checkpoints,
+    iter_tensor_leaves,
+    load_pt_checkpoint,
+    read_checkpoint,
+    save_pt_checkpoint,
+    set_by_typed_path,
+    tensor_to_float32_array,
+)
 import tensor_compress as tc
+
+
+SUPPORTED_DTYPES = {"F32", "BF16", "F16"}
 
 
 def _serialize_chunks(all_chunks):
     """Serialize compress_tensor output to bytes for file storage."""
     import pickle
-    return pickle.dumps(all_chunks, protocol=2)
+    return pickle.dumps(all_chunks, protocol=4)
 
 
-def _deserialize_chunks(data):
-    """Deserialize chunks from bytes."""
-    import pickle
-    return pickle.loads(data)
+def _strategy_to_dict(strategy):
+    return {
+        "path": strategy.path,
+        "encoding": strategy.encoding,
+        "ent_ialign": strategy.ent_ialign,
+        "ent_pcdelta": strategy.ent_pcdelta,
+        "ent_rotdelta": strategy.ent_rotdelta,
+    }
+
+
+def _default_output_path(input_path, output_dir):
+    return os.path.join(output_dir, "compressed_" + os.path.basename(input_path))
+
+
+def _find_base_array(base_tensors, name, n_elems):
+    if base_tensors is None or name not in base_tensors:
+        return None
+    base_arr = base_tensors[name]
+    if len(base_arr) != n_elems:
+        return None
+    return base_arr
+
+
+def _add_timing(timings, key, seconds):
+    timings[key] = timings.get(key, 0.0) + float(seconds)
+
+
+def _time_call(timings, key, fn, *args, **kwargs):
+    t0 = time.time()
+    value = fn(*args, **kwargs)
+    _add_timing(timings, key, time.time() - t0)
+    return value
+
+
+def compress_pt_checkpoint(filepath, base_tensors=None, output_path=None, verbose=True):
+    timings = {"per_tensor": []}
+    total_t0 = time.time()
+
+    state = _time_call(timings, "target_load_pt_seconds", load_pt_checkpoint, filepath)
+    t0 = time.time()
+    leaves = list(iter_tensor_leaves(state))
+    _add_timing(timings, "iter_tensor_leaves_seconds", time.time() - t0)
+
+    if output_path is None:
+        output_path = "compressed_" + os.path.basename(filepath)
+
+    if verbose:
+        header = "%-50s %-20s %8s %8s %6s %9s" % (
+            "Tensor", "Shape", "Size(MB)", "Path", "Ratio", "Enc MB/s")
+        print(header)
+        print("=" * 110)
+
+    tensor_entries = []
+    skipped_entries = []
+    total_orig = 0
+    total_comp = 0
+    compressed_count = 0
+
+    for leaf in leaves:
+        leaf_timing = {"name": leaf["name"]}
+        leaf_total_t0 = time.time()
+        name = leaf["name"]
+        tensor = leaf["tensor"]
+        dtype_str = leaf["dtype"]
+        shape = leaf["shape"]
+        n_elems = leaf["numel"]
+        original_bytes = int(tensor.numel() * tensor.element_size())
+        total_orig += original_bytes
+
+        if n_elems < 100 or dtype_str not in SUPPORTED_DTYPES:
+            total_comp += original_bytes
+            skipped_entries.append({
+                "name": name,
+                "path": leaf["path"],
+                "shape": shape,
+                "dtype": dtype_str,
+                "n_elems": n_elems,
+                "original_bytes": original_bytes,
+                "reason": "too_small" if n_elems < 100 else "unsupported_dtype",
+            })
+            leaf_timing["skipped"] = True
+            leaf_timing["total_seconds"] = time.time() - leaf_total_t0
+            timings["per_tensor"].append(leaf_timing)
+            continue
+
+        t0 = time.time()
+        ft_arr, dtype_str = tensor_to_float32_array(tensor)
+        dt = time.time() - t0
+        _add_timing(timings, "target_tensor_to_float32_seconds", dt)
+        leaf_timing["target_tensor_to_float32_seconds"] = dt
+
+        t0 = time.time()
+        base_arr = _find_base_array(base_tensors, name, len(ft_arr))
+        dt = time.time() - t0
+        _add_timing(timings, "base_lookup_seconds", dt)
+        leaf_timing["base_lookup_seconds"] = dt
+
+        t0 = time.time()
+        strategy = tc.analyze_strategy(ft_arr, base_arr)
+        dt = time.time() - t0
+        _add_timing(timings, "analyze_strategy_seconds", dt)
+        leaf_timing["analyze_strategy_seconds"] = dt
+
+        t0 = time.time()
+        codec_bytes, chunks, _ = tc.compress_tensor(ft_arr, strategy, base_arr)
+        enc_time = time.time() - t0
+        _add_timing(timings, "codec_encode_seconds", enc_time)
+        leaf_timing["codec_encode_seconds"] = enc_time
+
+        t0 = time.time()
+        chunk_bytes = _serialize_chunks(chunks)
+        dt = time.time() - t0
+        _add_timing(timings, "pickle_serialize_seconds", dt)
+        leaf_timing["pickle_serialize_seconds"] = dt
+        compressed_bytes = len(chunk_bytes)
+
+        t0 = time.time()
+        payload_tensor = bytes_to_uint8_tensor(chunk_bytes)
+        dt = time.time() - t0
+        _add_timing(timings, "bytes_to_uint8_tensor_seconds", dt)
+        leaf_timing["bytes_to_uint8_tensor_seconds"] = dt
+
+        t0 = time.time()
+        state = set_by_typed_path(state, leaf["path"], payload_tensor)
+        dt = time.time() - t0
+        _add_timing(timings, "set_by_typed_path_seconds", dt)
+        leaf_timing["set_by_typed_path_seconds"] = dt
+
+        ratio = compressed_bytes / float(original_bytes) if original_bytes else 0.0
+        enc_mbs = original_bytes / enc_time / 1e6 if enc_time > 0 else float("inf")
+        total_comp += compressed_bytes
+        compressed_count += 1
+
+        entry = {
+            "name": name,
+            "path": leaf["path"],
+            "shape": shape,
+            "dtype": dtype_str,
+            "n_elems": int(len(ft_arr)),
+            "original_bytes": original_bytes,
+            "compressed_bytes": compressed_bytes,
+            "codec_bytes": int(codec_bytes),
+            "ratio": ratio,
+            "strategy": _strategy_to_dict(strategy),
+            "requires_base": strategy.path in (tc.PATH_PCDELTA, tc.PATH_ROTDELTA),
+            "payload": "torch.uint8_pickle_chunks",
+            "encode_mbps": enc_mbs,
+        }
+        tensor_entries.append(entry)
+
+        leaf_timing.update({
+            "skipped": False,
+            "path": strategy.path,
+            "original_bytes": original_bytes,
+            "compressed_bytes": compressed_bytes,
+            "total_seconds": time.time() - leaf_total_t0,
+        })
+        timings["per_tensor"].append(leaf_timing)
+
+        if verbose:
+            print("%-50s %-20s %8.2f %8s %6.4f %9.1f" % (
+                name[:50], str(shape)[:20], original_bytes / 1e6,
+                strategy.path, ratio, enc_mbs))
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    t0 = time.time()
+    save_pt_checkpoint(state, output_path)
+    _add_timing(timings, "save_compressed_pt_seconds", time.time() - t0)
+
+    metadata = {
+        "format": "ALC_COMPRESSED_PT_V1",
+        "source_checkpoint": filepath,
+        "compressed_checkpoint": output_path,
+        "metadata_path": output_path + ".json",
+        "tensor_count": len(leaves),
+        "compressed_tensor_count": compressed_count,
+        "skipped_tensor_count": len(skipped_entries),
+        "total_original_bytes": total_orig,
+        "total_compressed_payload_bytes": total_comp,
+        "overall_payload_ratio": total_comp / float(total_orig) if total_orig > 0 else 0,
+        "tensors": tensor_entries,
+        "skipped_tensors": skipped_entries,
+    }
+
+    timings["total_seconds_before_metadata_write"] = time.time() - total_t0
+    metadata["timings"] = timings
+
+    t0 = time.time()
+    with open(output_path + ".json", "w") as fh:
+        json.dump(metadata, fh, indent=2)
+    _add_timing(timings, "metadata_write_seconds", time.time() - t0)
+    timings["total_seconds"] = time.time() - total_t0
+
+    if verbose:
+        print("=" * 110)
+        print("%-50s %-20s %8.2f %8s %6.4f" % (
+            "TOTAL", "", total_orig / 1e6, "",
+            total_comp / float(total_orig) if total_orig > 0 else 0))
+        print("Tensors: %d compressed, %d skipped" % (compressed_count, len(skipped_entries)))
+        print("Saved: %s" % output_path)
+        print("Metadata: %s" % (output_path + ".json"))
+
+    return metadata
 
 
 def compress_tensor_dict(ft_tensors, base_tensors=None, verbose=True, output_dir=None):
-    """Compress all tensors in a TensorDict and optionally save to disk.
-
-    Args:
-        ft_tensors: TensorDict of finetuned tensors (float32 numpy arrays).
-        base_tensors: Optional TensorDict of base tensors for delta compression.
-        verbose: Print per-tensor results.
-        output_dir: If set, save each compressed tensor as a .alc file.
-
-    Returns:
-        List of result dicts with compression stats.
-    """
     results = []
     total_orig = 0
     total_comp = 0
 
     if verbose:
-        header = "%-50s %-20s %8s %8s %6s %9s %9s %3s" % (
-            "Tensor", "Shape", "Size(MB)", "Path", "Ratio",
-            "Enc MB/s", "Dec MB/s", "OK")
+        header = "%-50s %-20s %8s %8s %6s %9s" % (
+            "Tensor", "Shape", "Size(MB)", "Path", "Ratio", "Enc MB/s")
         print(header)
-        print("=" * 125)
+        print("=" * 110)
 
     for name in ft_tensors:
         ft_arr = ft_tensors[name]
@@ -72,88 +269,48 @@ def compress_tensor_dict(ft_tensors, base_tensors=None, verbose=True, output_dir
         t0 = time.time()
         comp_sz, chunks, _ = tc.compress_tensor(ft_arr, strategy, base_arr)
         enc_time = time.time() - t0
+        chunk_bytes = _serialize_chunks(chunks)
 
-        t0 = time.time()
-        rec, _ = tc.decompress_tensor(chunks, strategy, n, base_arr)
-        dec_time = time.time() - t0
-
-        ok = np.array_equal(rec.view(np.uint32), ft_arr.view(np.uint32))
-        ratio = comp_sz / float(orig_bytes)
+        ratio = len(chunk_bytes) / float(orig_bytes)
         enc_mbs = orig_bytes / enc_time / 1e6 if enc_time > 0 else float("inf")
-        dec_mbs = orig_bytes / dec_time / 1e6 if dec_time > 0 else float("inf")
-        total_comp += comp_sz
-
-        # Save compressed tensor to disk
-        if output_dir is not None:
-            safe_name = name.replace("/", "__").replace(".", "_")
-            alc_path = os.path.join(output_dir, safe_name + ".alc")
-            header_data = json.dumps({
-                "name": name,
-                "shape": list(shape),
-                "dtype": dtype_str,
-                "n_elems": n,
-                "strategy": {
-                    "path": strategy.path,
-                    "encoding": strategy.encoding,
-                    "ent_ialign": strategy.ent_ialign,
-                    "ent_pcdelta": strategy.ent_pcdelta,
-                    "ent_rotdelta": strategy.ent_rotdelta,
-                },
-            }).encode("utf-8")
-            chunk_bytes = _serialize_chunks(chunks)
-            with open(alc_path, "wb") as fh:
-                fh.write(struct.pack("<I", len(header_data)))
-                fh.write(header_data)
-                fh.write(chunk_bytes)
+        total_comp += len(chunk_bytes)
 
         if verbose:
-            shape_str = str(shape)
-            size_mb = orig_bytes / 1e6
-            status = "Y" if ok else "N"
-            print("%-50s %-20s %8.2f %8s %6.4f %9.1f %9.1f %3s" % (
-                name[:50], shape_str[:20], size_mb, strategy.path,
-                ratio, enc_mbs, dec_mbs, status))
+            print("%-50s %-20s %8.2f %8s %6.4f %9.1f" % (
+                name[:50], str(shape)[:20], orig_bytes / 1e6,
+                strategy.path, ratio, enc_mbs))
 
         results.append({
             "name": name,
             "shape": list(shape),
             "dtype": dtype_str,
             "original_bytes": orig_bytes,
-            "compressed_bytes": comp_sz,
+            "compressed_bytes": len(chunk_bytes),
+            "codec_bytes": comp_sz,
             "ratio": ratio,
             "path": strategy.path,
             "encode_mbps": enc_mbs,
-            "decode_mbps": dec_mbs,
-            "bitwise_exact": bool(ok),
         })
 
     if verbose:
-        print("=" * 125)
+        print("=" * 110)
         overall_ratio = total_comp / float(total_orig) if total_orig > 0 else 0
-        all_ok = all(r["bitwise_exact"] for r in results)
         print("%-50s %-20s %8.2f %8s %6.4f" % (
             "TOTAL", "", total_orig / 1e6, "", overall_ratio))
-        print("Tensors: %d, All bitwise-exact: %s" % (len(results), all_ok))
+        print("Tensors: %d" % len(results))
 
     return results, total_orig, total_comp
 
 
 def find_matching_base(base_dir, ft_filename):
-    """Find the matching base file for a given finetuned file.
-
-    Handles common checkpoint layouts:
-      - base/model.safetensors ↔ checkpoint-N/model.safetensors
-      - base/mp_rank_00_model_states.pt ↔ ckpt/mp_rank_00_model_states.pt
-    """
+    """Find the matching base file for a given finetuned file."""
     if base_dir is None:
         return None
 
-    # Direct match by filename
     candidate = os.path.join(base_dir, ft_filename)
     if os.path.exists(candidate):
         return candidate
 
-    # Search recursively
     for root, dirs, files in os.walk(base_dir):
         if ft_filename in files:
             return os.path.join(root, ft_filename)
@@ -163,7 +320,7 @@ def find_matching_base(base_dir, ft_filename):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified checkpoint compression (DeepSpeed / Megatron / safetensors)")
+        description="ALC compression for PyTorch .pt checkpoints with preserved container structure")
     parser.add_argument("--input", type=str, help="Single input checkpoint file")
     parser.add_argument("--input_dir", type=str, help="Input directory to scan for checkpoints")
     parser.add_argument("--base", type=str, help="Base checkpoint file or directory (for delta)")
@@ -172,7 +329,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./compressed_output",
                         help="Output directory (default: ./compressed_output)")
     parser.add_argument("--filter", type=str, default=None,
-                        help="Glob filter for files (e.g., '*.safetensors')")
+                        help="Glob filter for files (e.g., '*.pt')")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-tensor output")
     parser.add_argument("--json_report", type=str, default=None,
                         help="Save JSON report to this path")
@@ -180,7 +337,6 @@ def main():
 
     verbose = not args.quiet
 
-    # Determine input files
     input_files = []
     if args.input:
         input_files.append(args.input)
@@ -198,9 +354,10 @@ def main():
         print("No checkpoint files found.")
         sys.exit(1)
 
-    # Determine base directory
-    base_dir = args.base_dir or (os.path.dirname(args.base) if args.base else None)
+    if args.output and len(input_files) != 1:
+        parser.error("--output can only be used with a single --input file")
 
+    base_dir = args.base_dir or (os.path.dirname(args.base) if args.base else None)
     os.makedirs(args.output_dir, exist_ok=True)
 
     all_results = {}
@@ -208,17 +365,13 @@ def main():
     grand_comp = 0
 
     for filepath in input_files:
+        if not (filepath.endswith(".pt") or filepath.endswith(".pth")):
+            raise ValueError("PT container output requires a .pt or .pth input: %s" % filepath)
+
         filename = os.path.basename(filepath)
         if verbose:
             print("\n>>> %s" % filepath)
 
-        t0 = time.time()
-        ft_tensors = read_checkpoint(filepath)
-        load_time = time.time() - t0
-        if verbose:
-            print("  Loaded %d tensors in %.1fs" % (len(ft_tensors), load_time))
-
-        # Load base tensors if available
         base_tensors = None
         if args.base and os.path.isfile(args.base):
             base_tensors = read_checkpoint(args.base)
@@ -229,36 +382,27 @@ def main():
                     print("  Base: %s" % base_path)
                 base_tensors = read_checkpoint(base_path)
 
-        # Create per-file output subdirectory
-        file_output_dir = os.path.join(args.output_dir, os.path.splitext(filename)[0])
-        os.makedirs(file_output_dir, exist_ok=True)
+        output_path = args.output if args.output else _default_output_path(filepath, args.output_dir)
+        metadata = compress_pt_checkpoint(
+            filepath, base_tensors=base_tensors, output_path=output_path, verbose=verbose)
 
-        results, total_orig, total_comp = compress_tensor_dict(
-            ft_tensors, base_tensors, verbose=verbose, output_dir=file_output_dir)
+        all_results[filepath] = metadata
+        grand_orig += metadata["total_original_bytes"]
+        grand_comp += metadata["total_compressed_payload_bytes"]
 
-        all_results[filepath] = {
-            "tensors": results,
-            "total_original_bytes": total_orig,
-            "total_compressed_bytes": total_comp,
-            "overall_ratio": total_comp / float(total_orig) if total_orig > 0 else 0,
-        }
-        grand_orig += total_orig
-        grand_comp += total_comp
-
-    # Summary
     print("\n" + "=" * 80)
-    print("GRAND TOTAL: %.2f MB → %.2f MB (ratio: %.4f)" % (
+    print("GRAND TOTAL: %.2f MB → %.2f MB (payload ratio: %.4f)" % (
         grand_orig / 1e6, grand_comp / 1e6,
         grand_comp / float(grand_orig) if grand_orig > 0 else 0))
     print("Files processed: %d" % len(input_files))
 
-    # Save JSON report
     if args.json_report:
         report = {
+            "format": "ALC_COMPRESSED_PT_REPORT_V1",
             "files": all_results,
             "grand_total_original_bytes": grand_orig,
-            "grand_total_compressed_bytes": grand_comp,
-            "grand_overall_ratio": grand_comp / float(grand_orig) if grand_orig > 0 else 0,
+            "grand_total_compressed_payload_bytes": grand_comp,
+            "grand_overall_payload_ratio": grand_comp / float(grand_orig) if grand_orig > 0 else 0,
         }
         with open(args.json_report, "w") as fh:
             json.dump(report, fh, indent=2)

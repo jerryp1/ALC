@@ -15,7 +15,7 @@ if _CPP_DIR not in sys.path:
 
 _CPP_TANS_AVAILABLE = False
 try:
-    import drotl1fmd_tans_cpp_codec as _cpp_tans
+    import alc_tans_cpp_codec as _cpp_tans
     _CPP_TANS_AVAILABLE = True
 except ImportError:
     _cpp_tans = None
@@ -224,8 +224,12 @@ def analyze_strategy(
     min_sample = max(DEFAULT_SAMPLE, max(n // 1000, 1))
     actual_sample = min(n, min_sample)
 
-    # Sample indices (deterministic for reproducibility)
-    rng = np.random.RandomState(0)
+    # Sample indices (deterministic for reproducibility).
+    # np.random.default_rng (PCG64/Generator) is used instead of the legacy
+    # RandomState: RandomState.choice(replace=False) scales with population
+    # size n even for a tiny sample, while Generator.choice scales with the
+    # sample size (~1000x faster for n~1e9, sample~1e6).
+    rng = np.random.default_rng(0)
     idx = rng.choice(n, size=actual_sample, replace=False)
     ft_sample = ft_f32[idx]
 
@@ -333,7 +337,7 @@ def _bsr32(value: np.ndarray) -> np.ndarray:
 def encode_sk_symbol(reference_u32: np.ndarray, target_u32: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Encode (reference, target) pair into (symbol, mantissa, width) using C++ logic.
 
-    Matches drotl1fmd_tans_cpp_codec.cpp::encode_pc_symbol_f32:
+    Matches alc_tans_cpp_codec.cpp::encode_pc_symbol_f32:
       - If ref < tgt:  delta = tgt - ref (positive), symbol = BIAS + 1 + bsr(delta)
       - If ref > tgt:  delta = ref - tgt (positive), symbol = BIAS - 1 - bsr(delta)
       - If ref == tgt: symbol = BIAS, mantissa = 0, width = 0
@@ -567,7 +571,7 @@ try:
     _cpp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpp")
     if _cpp_dir not in sys.path:
         sys.path.insert(0, _cpp_dir)
-    import drotl1fmd_tans_cpp_codec as _cpp_rotdelta
+    import alc_tans_cpp_codec as _cpp_rotdelta
     _CPP_ROTDELTA_AVAILABLE = True
 except ImportError:
     _cpp_rotdelta = None
@@ -592,15 +596,21 @@ def compress_tensor(
     if _CPP_ROTDELTA_AVAILABLE and base_f32 is not None:
         if strategy.path == PATH_ROTDELTA:
             t0 = time.perf_counter()
-            encoded = _cpp_rotdelta.encode_drotl1fmd_tans_f32(
-                base_f32.tobytes(), ft_f32.tobytes())
+            if hasattr(_cpp_rotdelta, "encode_rotdelta_tans_f32_buffer"):
+                encoded = _cpp_rotdelta.encode_rotdelta_tans_f32_buffer(base_f32, ft_f32)
+            else:
+                encoded = _cpp_rotdelta.encode_rotdelta_tans_f32(
+                    base_f32.tobytes(), ft_f32.tobytes())
             t_enc = time.perf_counter() - t0
             all_chunks = [(encoded, {"cpp_delta": "rotdelta"})]
             return len(encoded), all_chunks, t_enc
         elif strategy.path == PATH_PCDELTA:
             t0 = time.perf_counter()
-            encoded = _cpp_rotdelta.encode_pcdelta_tans_f32(
-                base_f32.tobytes(), ft_f32.tobytes())
+            if hasattr(_cpp_rotdelta, "encode_pcdelta_tans_f32_buffer"):
+                encoded = _cpp_rotdelta.encode_pcdelta_tans_f32_buffer(base_f32, ft_f32)
+            else:
+                encoded = _cpp_rotdelta.encode_pcdelta_tans_f32(
+                    base_f32.tobytes(), ft_f32.tobytes())
             t_enc = time.perf_counter() - t0
             all_chunks = [(encoded, {"cpp_delta": "pcdelta"})]
             return len(encoded), all_chunks, t_enc
@@ -653,13 +663,22 @@ def decompress_tensor(
             encoded_bytes = all_chunks[0][0]
             t0 = time.perf_counter()
             if cpp_delta == "rotdelta":
-                dec_bytes = _cpp_rotdelta.decode_drotl1fmd_tans_f32(
-                    encoded_bytes, base_f32.tobytes())
+                if hasattr(_cpp_rotdelta, "decode_rotdelta_tans_f32_array"):
+                    result = _cpp_rotdelta.decode_rotdelta_tans_f32_array(
+                        encoded_bytes, base_f32)
+                else:
+                    dec_bytes = _cpp_rotdelta.decode_rotdelta_tans_f32(
+                        encoded_bytes, base_f32.tobytes())
+                    result = np.frombuffer(dec_bytes, dtype=np.float32).copy()
             else:
-                dec_bytes = _cpp_rotdelta.decode_pcdelta_tans_f32(
-                    encoded_bytes, base_f32.tobytes())
+                if hasattr(_cpp_rotdelta, "decode_pcdelta_tans_f32_array"):
+                    result = _cpp_rotdelta.decode_pcdelta_tans_f32_array(
+                        encoded_bytes, base_f32)
+                else:
+                    dec_bytes = _cpp_rotdelta.decode_pcdelta_tans_f32(
+                        encoded_bytes, base_f32.tobytes())
+                    result = np.frombuffer(dec_bytes, dtype=np.float32).copy()
             t_dec = time.perf_counter() - t0
-            result = np.frombuffer(dec_bytes, dtype=np.float32).copy()
             return result, t_dec
 
     result = np.empty(n_elems, dtype=np.float32)
@@ -821,7 +840,7 @@ def compress_and_verify(
 # the number of valid (non-zero) bytes per element from the MSB side.
 # This "nvalid" column (values 0-4) is encoded with RC, and then each
 # byte column only stores bytes for elements where nvalid > col_index.
-# This captures the same leading-zero information that FMDelta's PCEncoder
+# This captures the same leading-zero information that ALC's PCEncoder
 # exploits, but within the columnar framework for better throughput.
 #
 # After rotl1, byte layout is [byte0(LSB), byte1, byte2, byte3(MSB)].
@@ -976,7 +995,7 @@ def decompress_tensor_lz(
 # of significant bits per element. This allows us to strip the known
 # leading-1 bit from the top byte, reducing its entropy.
 #
-# This is analogous to FMDelta's PCEncoder which encodes bsr(delta) as
+# This is analogous to ALC's PCEncoder which encodes bsr(delta) as
 # the level symbol and then stores the remainder bits without the leading 1.
 
 def _compute_nbits(rot_u32: np.ndarray) -> np.ndarray:

@@ -1,4 +1,5 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 
 #include <algorithm>
 #include <array>
@@ -529,6 +530,17 @@ public:
         bitstream_reader.assert_consumed();
     }
 
+    std::vector<std::uint8_t> decode(
+        const std::vector<std::uint8_t>& bitstream,
+        std::uint64_t bit_count,
+        std::uint64_t expected_size) const {
+        std::vector<std::uint8_t> decoded(static_cast<std::size_t>(expected_size));
+        decode_reverse(bitstream, bit_count, expected_size, [&](std::uint64_t output_index, std::uint8_t symbol) {
+            decoded[static_cast<std::size_t>(output_index)] = symbol;
+        });
+        return decoded;
+    }
+
 private:
     void build_fast_spread() {
         std::uint32_t position = 0;
@@ -794,7 +806,7 @@ static ParsedPayload unpack_payload(std::string_view encoded_bytes) {
 
     const auto* data = reinterpret_cast<const std::uint8_t*>(encoded_bytes.data());
     if (!std::equal(std::begin(kMagic), std::end(kMagic), data)) {
-        throw std::invalid_argument("invalid drotl1fmd-tANS magic");
+        throw std::invalid_argument("invalid rotdelta-tANS magic");
     }
 
     ParsedPayload parsed;
@@ -850,8 +862,8 @@ static ParsedPayload unpack_payload(std::string_view encoded_bytes) {
 
     std::array<bool, kF32Symbols> seen_symbols{};
     std::uint32_t total_frequency = 0;
-    parsed.joint_payload.symbols.reserve(symbol_count);
-    parsed.joint_payload.frequencies.reserve(symbol_count);
+    parsed.joint_payload.symbols.resize(symbol_count);
+    parsed.joint_payload.frequencies.resize(symbol_count);
     for (std::uint8_t index = 0; index < symbol_count; ++index) {
         const std::uint8_t symbol = data[offset++];
         const std::uint16_t frequency = read_u16_le(data + offset);
@@ -869,8 +881,8 @@ static ParsedPayload unpack_payload(std::string_view encoded_bytes) {
 
         seen_symbols[symbol] = true;
         total_frequency += frequency;
-        parsed.joint_payload.symbols.push_back(symbol);
-        parsed.joint_payload.frequencies.push_back(frequency);
+        parsed.joint_payload.symbols[index] = symbol;
+        parsed.joint_payload.frequencies[index] = frequency;
     }
     if (parsed.element_count != 0 && total_frequency != (1u << parsed.joint_payload.table_log)) {
         throw std::invalid_argument("joint frequencies do not sum to table size");
@@ -884,7 +896,29 @@ static ParsedPayload unpack_payload(std::string_view encoded_bytes) {
     return parsed;
 }
 
-static py::bytes encode_drotl1fmd_tans_f32_cpp(py::bytes reference_bytes, py::bytes target_bytes, std::uint32_t table_log) {
+struct F32BufferView {
+    const std::uint8_t* data = nullptr;
+    std::size_t size = 0;
+};
+
+static F32BufferView require_contiguous_f32_buffer(py::buffer buffer, const char* name) {
+    py::buffer_info info = buffer.request();
+    if (info.itemsize != 4) {
+        throw std::invalid_argument(std::string(name) + " must have 4-byte float32 elements");
+    }
+    if (info.ndim != 1) {
+        throw std::invalid_argument(std::string(name) + " must be a flat 1D float32 array");
+    }
+    if (info.size < 0 || info.strides.empty() || info.strides[0] != info.itemsize) {
+        throw std::invalid_argument(std::string(name) + " must be contiguous");
+    }
+    return {
+        reinterpret_cast<const std::uint8_t*>(info.ptr),
+        static_cast<std::size_t>(info.size) * static_cast<std::size_t>(info.itemsize)
+    };
+}
+
+static py::bytes encode_rotdelta_tans_f32_cpp(py::bytes reference_bytes, py::bytes target_bytes, std::uint32_t table_log) {
     std::string_view reference_view(reference_bytes);
     std::string_view target_view(target_bytes);
 
@@ -905,8 +939,7 @@ static py::bytes encode_drotl1fmd_tans_f32_cpp(py::bytes reference_bytes, py::by
         const auto* target_data = reinterpret_cast<const std::uint8_t*>(target_view.data());
         const std::uint64_t element_count = reference_view.size() / 4;
 
-        std::vector<std::uint8_t> joint_symbols;
-        joint_symbols.reserve(static_cast<std::size_t>(element_count));
+        std::vector<std::uint8_t> joint_symbols(static_cast<std::size_t>(element_count));
         std::array<std::uint32_t, kF32Symbols> joint_symbol_counts{};
         PackedBitWriter mantissa_writer;
         mantissa_writer.reserve_bits(element_count * (kF32Bits - 1u));
@@ -915,7 +948,7 @@ static py::bytes encode_drotl1fmd_tans_f32_cpp(py::bytes reference_bytes, py::by
             const std::uint32_t reference_value = read_u32_le(reference_data + index * 4);
             const std::uint32_t target_value = read_u32_le(target_data + index * 4);
             const auto encoded_symbol = encode_pc_symbol_f32(rotl1_u32(reference_value), rotl1_u32(target_value));
-            joint_symbols.push_back(encoded_symbol.first);
+            joint_symbols[static_cast<std::size_t>(index)] = encoded_symbol.first;
             ++joint_symbol_counts[encoded_symbol.first];
             mantissa_writer.write_bits(encoded_symbol.second.first, encoded_symbol.second.second);
         }
@@ -933,7 +966,7 @@ static py::bytes encode_drotl1fmd_tans_f32_cpp(py::bytes reference_bytes, py::by
     return py::bytes(reinterpret_cast<const char*>(packed.data()), packed.size());
 }
 
-static py::bytes decode_drotl1fmd_tans_f32_cpp(py::bytes encoded_bytes, py::bytes reference_bytes) {
+static py::bytes decode_rotdelta_tans_f32_cpp(py::bytes encoded_bytes, py::bytes reference_bytes) {
     std::string_view encoded_view(encoded_bytes);
     std::string_view reference_view(reference_bytes);
 
@@ -949,30 +982,140 @@ static py::bytes decode_drotl1fmd_tans_f32_cpp(py::bytes encoded_bytes, py::byte
         output.resize(reference_view.size());
 
         if (parsed.element_count != 0) {
-            const TansCoder coder(
-                parsed.joint_payload.table_log,
-                parsed.joint_payload.symbols,
-                parsed.joint_payload.frequencies);
             PackedTailBitReader mantissa_reader(parsed.mantissa_stream, parsed.mantissa_bit_count);
 
-            coder.decode_reverse(
-                parsed.joint_payload.bitstream,
-                parsed.joint_payload.bit_count,
-                parsed.joint_payload.original_size,
-                [&](std::uint64_t element_index, std::uint8_t symbol) {
-                    const std::uint32_t reference_value = read_u32_le(reference_data + element_index * 4);
-                    const std::uint32_t target_rotl = decode_pc_symbol_f32_from_tail(
-                        rotl1_u32(reference_value),
-                        symbol,
-                        mantissa_reader);
-                    const std::uint32_t target_value = rotr1_u32(target_rotl);
-                    write_u32_le(output.data() + static_cast<std::size_t>(element_index * 4), target_value);
-                });
+            const auto consume_symbol = [&](std::uint64_t element_index, std::uint8_t symbol) {
+                const std::uint32_t reference_value = read_u32_le(reference_data + element_index * 4);
+                const std::uint32_t target_rotl = decode_pc_symbol_f32_from_tail(
+                    rotl1_u32(reference_value),
+                    symbol,
+                    mantissa_reader);
+                const std::uint32_t target_value = rotr1_u32(target_rotl);
+                write_u32_le(output.data() + static_cast<std::size_t>(element_index * 4), target_value);
+            };
+
+            if (parsed.joint_payload.table_log == kFastTableLog) {
+                const FastTansCoder8 coder(parsed.joint_payload.symbols, parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            } else {
+                const TansCoder coder(
+                    parsed.joint_payload.table_log,
+                    parsed.joint_payload.symbols,
+                    parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            }
 
             mantissa_reader.assert_consumed();
         }
     }
     return py::bytes(reinterpret_cast<const char*>(output.data()), output.size());
+}
+
+static py::array_t<float> decode_rotdelta_tans_f32_array_cpp(py::bytes encoded_bytes, py::buffer reference_buffer) {
+    std::string_view encoded_view(encoded_bytes);
+    const F32BufferView reference_view = require_contiguous_f32_buffer(reference_buffer, "reference");
+    const ParsedPayload parsed = unpack_payload(encoded_view);
+    if (reference_view.size != parsed.element_count * 4) {
+        throw std::invalid_argument("reference byte length does not match encoded element count");
+    }
+
+    py::array_t<float> output_array(static_cast<py::ssize_t>(parsed.element_count));
+    auto* output = reinterpret_cast<std::uint8_t*>(output_array.mutable_data());
+
+    {
+        py::gil_scoped_release release;
+        if (parsed.element_count != 0) {
+            PackedTailBitReader mantissa_reader(parsed.mantissa_stream, parsed.mantissa_bit_count);
+
+            const auto consume_symbol = [&](std::uint64_t element_index, std::uint8_t symbol) {
+                const std::uint32_t reference_value = read_u32_le(reference_view.data + element_index * 4);
+                const std::uint32_t target_rotl = decode_pc_symbol_f32_from_tail(
+                    rotl1_u32(reference_value),
+                    symbol,
+                    mantissa_reader);
+                const std::uint32_t target_value = rotr1_u32(target_rotl);
+                write_u32_le(output + static_cast<std::size_t>(element_index * 4), target_value);
+            };
+
+            if (parsed.joint_payload.table_log == kFastTableLog) {
+                const FastTansCoder8 coder(parsed.joint_payload.symbols, parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            } else {
+                const TansCoder coder(
+                    parsed.joint_payload.table_log,
+                    parsed.joint_payload.symbols,
+                    parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            }
+
+            mantissa_reader.assert_consumed();
+        }
+    }
+    return output_array;
+}
+
+static py::bytes encode_rotdelta_tans_f32_buffer_cpp(py::buffer reference_buffer, py::buffer target_buffer, std::uint32_t table_log) {
+    const F32BufferView reference_view = require_contiguous_f32_buffer(reference_buffer, "reference");
+    const F32BufferView target_view = require_contiguous_f32_buffer(target_buffer, "target");
+
+    if (reference_view.size != target_view.size) {
+        throw std::invalid_argument("reference and target must have the same byte length");
+    }
+    if (reference_view.size % 4 != 0) {
+        throw std::invalid_argument("float32 byte length must be a multiple of 4");
+    }
+    if (table_log < kMinTableLog || table_log > kMaxTableLog) {
+        throw std::invalid_argument("table_log must be between 7 and 15");
+    }
+
+    std::vector<std::uint8_t> packed;
+    {
+        py::gil_scoped_release release;
+        const auto* reference_data = reference_view.data;
+        const auto* target_data = target_view.data;
+        const std::uint64_t element_count = reference_view.size / 4;
+
+        std::vector<std::uint8_t> joint_symbols(static_cast<std::size_t>(element_count));
+        std::array<std::uint32_t, kF32Symbols> joint_symbol_counts{};
+        PackedBitWriter mantissa_writer;
+        mantissa_writer.reserve_bits(element_count * (kF32Bits - 1u));
+
+        for (std::uint64_t index = 0; index < element_count; ++index) {
+            const std::uint32_t reference_value = read_u32_le(reference_data + index * 4);
+            const std::uint32_t target_value = read_u32_le(target_data + index * 4);
+            const auto encoded_symbol = encode_pc_symbol_f32(rotl1_u32(reference_value), rotl1_u32(target_value));
+            joint_symbols[static_cast<std::size_t>(index)] = encoded_symbol.first;
+            ++joint_symbol_counts[encoded_symbol.first];
+            mantissa_writer.write_bits(encoded_symbol.second.first, encoded_symbol.second.second);
+        }
+
+        const TansPayload joint_payload = tans_encode_symbols(
+            joint_symbols,
+            joint_symbol_counts,
+            static_cast<std::uint8_t>(table_log));
+        packed = pack_payload(
+            element_count,
+            joint_payload,
+            mantissa_writer.bytes(),
+            mantissa_writer.bit_count());
+    }
+    return py::bytes(reinterpret_cast<const char*>(packed.data()), packed.size());
 }
 
 // ============================================================
@@ -1007,8 +1150,7 @@ static py::bytes encode_pcdelta_tans_f32_cpp(py::bytes reference_bytes, py::byte
         const auto* tgt_data = reinterpret_cast<const std::uint8_t*>(target_view.data());
         const std::uint64_t n = reference_view.size() / 4;
 
-        std::vector<std::uint8_t> joint_symbols;
-        joint_symbols.reserve(static_cast<std::size_t>(n));
+        std::vector<std::uint8_t> joint_symbols(static_cast<std::size_t>(n));
         std::array<std::uint32_t, kF32Symbols> joint_symbol_counts{};
         PackedBitWriter mantissa_writer;
         mantissa_writer.reserve_bits(n * (kF32Bits - 1u));
@@ -1017,7 +1159,7 @@ static py::bytes encode_pcdelta_tans_f32_cpp(py::bytes reference_bytes, py::byte
             const std::uint32_t ref_pc = pcmap_u32(read_u32_le(ref_data + i * 4));
             const std::uint32_t tgt_pc = pcmap_u32(read_u32_le(tgt_data + i * 4));
             const auto enc = encode_pc_symbol_f32(ref_pc, tgt_pc);
-            joint_symbols.push_back(enc.first);
+            joint_symbols[static_cast<std::size_t>(i)] = enc.first;
             ++joint_symbol_counts[enc.first];
             mantissa_writer.write_bits(enc.second.first, enc.second.second);
         }
@@ -1042,20 +1184,108 @@ static py::bytes decode_pcdelta_tans_f32_cpp(py::bytes encoded_bytes, py::bytes 
         output.resize(reference_view.size());
 
         if (parsed.element_count != 0) {
-            const TansCoder coder(parsed.joint_payload.table_log, parsed.joint_payload.symbols, parsed.joint_payload.frequencies);
             PackedTailBitReader mantissa_reader(parsed.mantissa_stream, parsed.mantissa_bit_count);
 
-            coder.decode_reverse(
-                parsed.joint_payload.bitstream, parsed.joint_payload.bit_count, parsed.joint_payload.original_size,
-                [&](std::uint64_t idx, std::uint8_t symbol) {
-                    const std::uint32_t ref_pc = pcmap_u32(read_u32_le(ref_data + idx * 4));
-                    const std::uint32_t tgt_pc = decode_pc_symbol_f32_from_tail(ref_pc, symbol, mantissa_reader);
-                    write_u32_le(output.data() + idx * 4, pcmap_inverse_u32(tgt_pc));
-                });
+            const auto consume_symbol = [&](std::uint64_t idx, std::uint8_t symbol) {
+                const std::uint32_t ref_pc = pcmap_u32(read_u32_le(ref_data + idx * 4));
+                const std::uint32_t tgt_pc = decode_pc_symbol_f32_from_tail(ref_pc, symbol, mantissa_reader);
+                write_u32_le(output.data() + idx * 4, pcmap_inverse_u32(tgt_pc));
+            };
+
+            if (parsed.joint_payload.table_log == kFastTableLog) {
+                const FastTansCoder8 coder(parsed.joint_payload.symbols, parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            } else {
+                const TansCoder coder(parsed.joint_payload.table_log, parsed.joint_payload.symbols, parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            }
             mantissa_reader.assert_consumed();
         }
     }
     return py::bytes(reinterpret_cast<const char*>(output.data()), output.size());
+}
+
+static py::array_t<float> decode_pcdelta_tans_f32_array_cpp(py::bytes encoded_bytes, py::buffer reference_buffer) {
+    std::string_view encoded_view(encoded_bytes);
+    const F32BufferView reference_view = require_contiguous_f32_buffer(reference_buffer, "reference");
+    const ParsedPayload parsed = unpack_payload(encoded_view);
+    if (reference_view.size != parsed.element_count * 4) throw std::invalid_argument("reference size mismatch");
+
+    py::array_t<float> output_array(static_cast<py::ssize_t>(parsed.element_count));
+    auto* output = reinterpret_cast<std::uint8_t*>(output_array.mutable_data());
+
+    {
+        py::gil_scoped_release release;
+        if (parsed.element_count != 0) {
+            PackedTailBitReader mantissa_reader(parsed.mantissa_stream, parsed.mantissa_bit_count);
+
+            const auto consume_symbol = [&](std::uint64_t idx, std::uint8_t symbol) {
+                const std::uint32_t ref_pc = pcmap_u32(read_u32_le(reference_view.data + idx * 4));
+                const std::uint32_t tgt_pc = decode_pc_symbol_f32_from_tail(ref_pc, symbol, mantissa_reader);
+                write_u32_le(output + idx * 4, pcmap_inverse_u32(tgt_pc));
+            };
+
+            if (parsed.joint_payload.table_log == kFastTableLog) {
+                const FastTansCoder8 coder(parsed.joint_payload.symbols, parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            } else {
+                const TansCoder coder(parsed.joint_payload.table_log, parsed.joint_payload.symbols, parsed.joint_payload.frequencies);
+                coder.decode_reverse(
+                    parsed.joint_payload.bitstream,
+                    parsed.joint_payload.bit_count,
+                    parsed.joint_payload.original_size,
+                    consume_symbol);
+            }
+            mantissa_reader.assert_consumed();
+        }
+    }
+    return output_array;
+}
+
+static py::bytes encode_pcdelta_tans_f32_buffer_cpp(py::buffer reference_buffer, py::buffer target_buffer, std::uint32_t table_log) {
+    const F32BufferView reference_view = require_contiguous_f32_buffer(reference_buffer, "reference");
+    const F32BufferView target_view = require_contiguous_f32_buffer(target_buffer, "target");
+    if (reference_view.size != target_view.size) throw std::invalid_argument("size mismatch");
+    if (reference_view.size % 4 != 0) throw std::invalid_argument("not multiple of 4");
+    if (table_log < kMinTableLog || table_log > kMaxTableLog) throw std::invalid_argument("table_log out of range");
+
+    std::vector<std::uint8_t> packed;
+    {
+        py::gil_scoped_release release;
+        const auto* ref_data = reference_view.data;
+        const auto* tgt_data = target_view.data;
+        const std::uint64_t n = reference_view.size / 4;
+
+        std::vector<std::uint8_t> joint_symbols(static_cast<std::size_t>(n));
+        std::array<std::uint32_t, kF32Symbols> joint_symbol_counts{};
+        PackedBitWriter mantissa_writer;
+        mantissa_writer.reserve_bits(n * (kF32Bits - 1u));
+
+        for (std::uint64_t i = 0; i < n; ++i) {
+            const std::uint32_t ref_pc = pcmap_u32(read_u32_le(ref_data + i * 4));
+            const std::uint32_t tgt_pc = pcmap_u32(read_u32_le(tgt_data + i * 4));
+            const auto enc = encode_pc_symbol_f32(ref_pc, tgt_pc);
+            joint_symbols[static_cast<std::size_t>(i)] = enc.first;
+            ++joint_symbol_counts[enc.first];
+            mantissa_writer.write_bits(enc.second.first, enc.second.second);
+        }
+
+        const TansPayload joint_payload = tans_encode_symbols(joint_symbols, joint_symbol_counts, static_cast<std::uint8_t>(table_log));
+        packed = pack_payload(n, joint_payload, mantissa_writer.bytes(), mantissa_writer.bit_count());
+    }
+    return py::bytes(reinterpret_cast<const char*>(packed.data()), packed.size());
 }
 
 // ============================================================
@@ -1187,6 +1417,129 @@ private:
     std::vector<std::int32_t> nb_values_;
 };
 
+static constexpr std::uint8_t kByteTableLog = 8u;
+static constexpr std::uint32_t kByteTableSize = 1u << kByteTableLog;
+
+class FastByteTansCoder8 {
+public:
+    FastByteTansCoder8(std::vector<std::uint8_t> symbols, std::vector<std::uint16_t> frequencies)
+        : symbol_count_(symbols.size()) {
+        if (symbols.size() != frequencies.size()) throw std::invalid_argument("symbols/frequencies mismatch");
+        if (symbols.empty()) throw std::invalid_argument("empty alphabet");
+        std::uint32_t total = 0;
+        for (auto f : frequencies) { if (f == 0) throw std::invalid_argument("zero frequency"); total += f; }
+        if (total != kByteTableSize) throw std::invalid_argument("frequencies must sum to table size");
+        for (std::size_t i = 0; i < symbols.size(); ++i) {
+            symbol_by_index_[i] = symbols[i];
+            frequency_by_index_[i] = frequencies[i];
+            symbol_to_index_[symbols[i]] = static_cast<std::uint16_t>(i);
+            symbol_is_present_[symbols[i]] = true;
+        }
+        build_fast_spread();
+        build_decode_table();
+        build_encoding_table();
+    }
+
+    PackedBitStream encode(const std::vector<std::uint8_t>& data) const {
+        if (data.empty()) return {};
+        std::uint32_t state = kByteTableSize;
+        const std::uint32_t original_state = state;
+        PackedBitWriter writer;
+        writer.reserve_bits(data.size() * 8u + 2u * kByteTableLog);
+        for (std::uint8_t sym : data) {
+            if (!symbol_is_present_[sym]) throw std::invalid_argument("symbol not in alphabet");
+            encode_step(state, symbol_to_index_[sym], writer);
+        }
+        writer.write_bits(state - kByteTableSize, kByteTableLog);
+        writer.write_bits(original_state - kByteTableSize, kByteTableLog);
+        PackedBitStream result;
+        result.bytes = writer.bytes();
+        result.bit_count = writer.bit_count();
+        return result;
+    }
+
+    std::vector<std::uint8_t> decode(const std::vector<std::uint8_t>& bitstream,
+                                      std::uint64_t bit_count, std::uint64_t expected_size) const {
+        std::vector<std::uint8_t> result(static_cast<std::size_t>(expected_size));
+        if (expected_size == 0) return result;
+        if (bit_count < 2u * kByteTableLog) throw std::invalid_argument("bitstream too small");
+        PackedTailBitReader reader(bitstream, bit_count);
+        const std::uint32_t original_state = reader.read_bits_from_tail(kByteTableLog);
+        std::uint32_t state = reader.read_bits_from_tail(kByteTableLog);
+        for (std::uint64_t ri = 0; ri < expected_size; ++ri) {
+            const DecodeEntry& entry = decode_table_[state];
+            const std::uint32_t bits = reader.read_bits_from_tail(entry.nb_bits);
+            state = entry.new_state + bits;
+            result[static_cast<std::size_t>(expected_size - 1u - ri)] = entry.symbol;
+        }
+        if (state != original_state) throw std::invalid_argument("invalid final state");
+        reader.assert_consumed();
+        return result;
+    }
+
+private:
+    void build_fast_spread() {
+        std::uint32_t pos = 0;
+        std::uint32_t step = (kByteTableSize >> 1u) + (kByteTableSize >> 3u) + 3u;
+        while (std::gcd(step, kByteTableSize) != 1u) step += 2u;
+        for (std::uint16_t si = 0; si < symbol_count_; ++si)
+            for (std::uint16_t c = 0; c < frequency_by_index_[si]; ++c) {
+                symbol_spread_[pos] = si;
+                pos = (pos + step) & (kByteTableSize - 1u);
+            }
+    }
+
+    void build_decode_table() {
+        std::array<std::uint32_t, kByteMaxSymbols> next_vals{};
+        for (std::size_t i = 0; i < symbol_count_; ++i) next_vals[i] = frequency_by_index_[i];
+        for (std::uint32_t s = 0; s < kByteTableSize; ++s) {
+            const std::uint16_t si = symbol_spread_[s];
+            const std::uint32_t tmp = next_vals[si]++;
+            const std::uint8_t nb = static_cast<std::uint8_t>(kByteTableLog - bsr32(tmp));
+            decode_table_[s] = {symbol_by_index_[si], nb, (tmp << nb) - kByteTableSize};
+        }
+    }
+
+    void build_encoding_table() {
+        std::int32_t cum = 0;
+        for (std::size_t i = 0; i < symbol_count_; ++i) {
+            starts_[i] = cum - static_cast<std::int32_t>(frequency_by_index_[i]);
+            cum += frequency_by_index_[i];
+        }
+        std::array<std::uint32_t, kByteMaxSymbols> next_vals{};
+        for (std::size_t i = 0; i < symbol_count_; ++i) next_vals[i] = frequency_by_index_[i];
+        for (std::uint32_t tp = 0; tp < kByteTableSize; ++tp) {
+            const std::uint16_t si = symbol_spread_[tp];
+            encoding_table_[starts_[si] + static_cast<std::int32_t>(next_vals[si])] = tp + kByteTableSize;
+            ++next_vals[si];
+        }
+        constexpr std::uint32_t r = kByteTableLog + 1u;
+        for (std::size_t i = 0; i < symbol_count_; ++i) {
+            const std::uint32_t k = kByteTableLog - bsr32(frequency_by_index_[i]);
+            nb_values_[i] = (static_cast<std::int32_t>(k) << r) - static_cast<std::int32_t>(frequency_by_index_[i] << k);
+        }
+    }
+
+    void encode_step(std::uint32_t& state, std::uint16_t si, PackedBitWriter& w) const {
+        constexpr std::uint32_t r = kByteTableLog + 1u;
+        const std::uint32_t nb = static_cast<std::uint32_t>(
+            (static_cast<std::int64_t>(state) + nb_values_[si]) >> r);
+        w.write_bits(state & low_bits_mask(nb), nb);
+        state = encoding_table_[starts_[si] + static_cast<std::int32_t>(state >> nb)];
+    }
+
+    std::size_t symbol_count_ = 0;
+    std::array<std::uint8_t, kByteMaxSymbols> symbol_by_index_{};
+    std::array<std::uint16_t, kByteMaxSymbols> frequency_by_index_{};
+    std::array<std::uint16_t, kByteMaxSymbols> symbol_to_index_{};
+    std::array<bool, kByteMaxSymbols> symbol_is_present_{};
+    std::array<std::uint16_t, kByteTableSize> symbol_spread_{};
+    std::array<DecodeEntry, kByteTableSize> decode_table_{};
+    std::array<std::uint32_t, kByteTableSize> encoding_table_{};
+    std::array<std::int32_t, kByteMaxSymbols> starts_{};
+    std::array<std::int32_t, kByteMaxSymbols> nb_values_{};
+};
+
 static std::pair<std::vector<std::uint8_t>, std::vector<std::uint16_t>>
 normalize_byte_frequencies(const std::array<std::uint32_t, 256>& counts,
                            std::uint64_t data_size, std::uint8_t table_log) {
@@ -1251,9 +1604,15 @@ static py::bytes tans_encode_bytes_cpp(py::bytes input_bytes, std::uint32_t tabl
         std::array<std::uint32_t, 256> counts{};
         for (std::uint64_t i = 0; i < n; ++i) counts[data[i]]++;
         auto norm = normalize_byte_frequencies(counts, n, static_cast<std::uint8_t>(table_log));
-        ByteTansCoder coder(static_cast<std::uint8_t>(table_log), norm.first, norm.second);
         std::vector<std::uint8_t> input_vec(data, data + n);
-        auto stream = coder.encode(input_vec);
+        PackedBitStream stream;
+        if (table_log == kByteTableLog) {
+            FastByteTansCoder8 coder(norm.first, norm.second);
+            stream = coder.encode(input_vec);
+        } else {
+            ByteTansCoder coder(static_cast<std::uint8_t>(table_log), norm.first, norm.second);
+            stream = coder.encode(input_vec);
+        }
         packed.reserve(26 + norm.first.size() * 3 + stream.bytes.size());
         packed.insert(packed.end(), kByteTansMagic, kByteTansMagic + 4);
         append_u64_le(packed, n);
@@ -1292,7 +1651,10 @@ static py::bytes tans_decode_bytes_cpp(py::bytes encoded_bytes) {
         }
         std::vector<std::uint8_t> bitstream(p + off, p + off + ss);
         if (orig_size == 0) { output.clear(); }
-        else {
+        else if (tlog == kByteTableLog) {
+            FastByteTansCoder8 coder(std::move(symbols), std::move(freqs));
+            output = coder.decode(bitstream, bit_count, orig_size);
+        } else {
             ByteTansCoder coder(tlog, std::move(symbols), std::move(freqs));
             output = coder.decode(bitstream, bit_count, orig_size);
         }
@@ -1302,18 +1664,28 @@ static py::bytes tans_decode_bytes_cpp(py::bytes encoded_bytes) {
 
 }  // namespace
 
-PYBIND11_MODULE(drotl1fmd_tans_cpp_codec, module) {
+PYBIND11_MODULE(alc_tans_cpp_codec, module) {
     module.doc() = "High-performance C++ tANS codec";
-    module.def("encode_drotl1fmd_tans_f32", &encode_drotl1fmd_tans_f32_cpp,
+    module.def("encode_rotdelta_tans_f32", &encode_rotdelta_tans_f32_cpp,
                py::arg("reference_bytes"), py::arg("target_bytes"),
                py::arg("table_log") = kDefaultTableLog);
-    module.def("decode_drotl1fmd_tans_f32", &decode_drotl1fmd_tans_f32_cpp,
+    module.def("decode_rotdelta_tans_f32", &decode_rotdelta_tans_f32_cpp,
                py::arg("encoded_bytes"), py::arg("reference_bytes"));
+    module.def("encode_rotdelta_tans_f32_buffer", &encode_rotdelta_tans_f32_buffer_cpp,
+               py::arg("reference"), py::arg("target"),
+               py::arg("table_log") = kDefaultTableLog);
+    module.def("decode_rotdelta_tans_f32_array", &decode_rotdelta_tans_f32_array_cpp,
+               py::arg("encoded_bytes"), py::arg("reference"));
     module.def("encode_pcdelta_tans_f32", &encode_pcdelta_tans_f32_cpp,
                py::arg("reference_bytes"), py::arg("target_bytes"),
                py::arg("table_log") = kDefaultTableLog);
     module.def("decode_pcdelta_tans_f32", &decode_pcdelta_tans_f32_cpp,
                py::arg("encoded_bytes"), py::arg("reference_bytes"));
+    module.def("encode_pcdelta_tans_f32_buffer", &encode_pcdelta_tans_f32_buffer_cpp,
+               py::arg("reference"), py::arg("target"),
+               py::arg("table_log") = kDefaultTableLog);
+    module.def("decode_pcdelta_tans_f32_array", &decode_pcdelta_tans_f32_array_cpp,
+               py::arg("encoded_bytes"), py::arg("reference"));
     module.def("tans_encode", &tans_encode_bytes_cpp,
                py::arg("data"), py::arg("table_log") = 8);
     module.def("tans_decode", &tans_decode_bytes_cpp,

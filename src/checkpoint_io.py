@@ -29,6 +29,110 @@ class TensorDict(OrderedDict):
         self.metadata[name] = {"dtype": original_dtype, "shape": tuple(shape)}
 
 
+def load_pt_checkpoint(filepath):
+    torch = _get_torch()
+    return torch.load(filepath, map_location="cpu", weights_only=False)
+
+
+def save_pt_checkpoint(state, filepath):
+    torch = _get_torch()
+    torch.save(state, filepath, _use_new_zipfile_serialization=True, pickle_protocol=5)
+
+
+def _path_step(kind, key):
+    return {"kind": kind, "key": key}
+
+
+def _display_child(prefix, key, indexed):
+    if indexed:
+        return "%s[%d]" % (prefix, key) if prefix else "[%d]" % key
+    return "%s.%s" % (prefix, key) if prefix else str(key)
+
+
+def iter_tensor_leaves(obj, prefix="", path=None):
+    torch = _get_torch()
+    if path is None:
+        path = []
+
+    if isinstance(obj, torch.Tensor):
+        yield {
+            "name": prefix.rstrip("."),
+            "path": list(path),
+            "tensor": obj,
+            "shape": list(obj.shape),
+            "dtype": _torch_dtype_to_str(obj.dtype),
+            "numel": int(obj.numel()),
+        }
+        return
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child_prefix = _display_child(prefix, key, indexed=False)
+            yield from iter_tensor_leaves(value, child_prefix, path + [_path_step("dict", key)])
+        return
+
+    if isinstance(obj, list):
+        for index, value in enumerate(obj):
+            child_prefix = _display_child(prefix, index, indexed=True)
+            yield from iter_tensor_leaves(value, child_prefix, path + [_path_step("list", index)])
+        return
+
+    if isinstance(obj, tuple):
+        for index, value in enumerate(obj):
+            child_prefix = _display_child(prefix, index, indexed=True)
+            yield from iter_tensor_leaves(value, child_prefix, path + [_path_step("tuple", index)])
+
+
+def get_by_typed_path(obj, path):
+    current = obj
+    for step in path:
+        current = current[step["key"]]
+    return current
+
+
+def set_by_typed_path(obj, path, value):
+    if not path:
+        return value
+
+    step = path[0]
+    key = step["key"]
+    if step["kind"] == "dict":
+        obj[key] = set_by_typed_path(obj[key], path[1:], value)
+        return obj
+    if step["kind"] == "list":
+        obj[key] = set_by_typed_path(obj[key], path[1:], value)
+        return obj
+    if step["kind"] == "tuple":
+        items = list(obj)
+        items[key] = set_by_typed_path(items[key], path[1:], value)
+        return tuple(items)
+    raise ValueError("unknown path step kind: %s" % step["kind"])
+
+
+def tensor_to_float32_array(tensor):
+    return _tensor_to_float32(tensor)
+
+
+def float32_array_to_tensor(arr_f32, dtype_str, shape):
+    torch = _get_torch()
+    shaped = np.asarray(arr_f32, dtype=np.float32).reshape(shape)
+    tensor = torch.from_numpy(shaped.copy())
+    if dtype_str == "BF16":
+        return tensor.to(dtype=torch.bfloat16)
+    if dtype_str == "F16":
+        return tensor.to(dtype=torch.float16)
+    return tensor.to(dtype=torch.float32)
+
+
+def bytes_to_uint8_tensor(data):
+    torch = _get_torch()
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+
+
+def uint8_tensor_to_bytes(tensor):
+    return bytes(tensor.detach().cpu().numpy().tobytes())
+
+
 def _to_float32(raw_bytes, dtype_str, shape):
     """Convert raw bytes to flat float32 numpy array."""
     if dtype_str in ("F32", "float32"):
@@ -53,7 +157,7 @@ def _torch_dtype_to_str(dtype):
         "torch.half": "F16",
     }
     key = str(dtype)
-    return dtype_map.get(key, "F32")
+    return dtype_map.get(key, key)
 
 
 def _tensor_to_float32(tensor):
