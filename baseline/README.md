@@ -1,38 +1,36 @@
 # Baseline Compression Methods
 
-Clean implementations of baseline compression methods for LLM checkpoint
-delta compression.
+Clean baseline benchmarks for LLM checkpoint compression.
 
-## Directory Layout
+## Layout
 
-```
+```text
 baseline/
-├── README.md                    
+├── README.md
+├── run.sh
 └── src/
-    ├── README.md                          
-    ├── benchmark_compression_methods.py   
-    └── benchmark_hybrid_delta.py          
+    └── benchmark_compression_methods.py
 ```
 
-## Quick Start
+## Usage
 
 ```bash
-# 6-method end-to-end benchmark
-./run.sh methods --base /path/to/base.pt --ft /path/to/ft.pt
-
-# 3-transform × 2-encoding detailed analysis
-./run.sh hybrid --base /path/to/base.pt --ft /path/to/ft.pt
+./run.sh methods --base base.pt --ft target.pt --output results.csv
 ```
 
+Optional:
 
-## Methods & References
+```bash
+./run.sh methods --base base.pt --ft target.pt --methods fmdelta,zipnn,zstd
+./run.sh methods --base base.pt --ft target.pt --tensor-idx 0 1 2 --iterations 3
+```
+
+## Methods
 
 | Method | Reference | Description |
 |--------|-----------|-------------|
-| **hybrid** | Ours | Adaptive compression |
-| **fmdelta** | FM-Delta | PCMap + range coding |
-| **xor_zstd** | ZipLLM | XOR delta + Zstandard |
-| **exponent_huffman** | ZipNN | Exponent-bit extraction + Huffman/ZSTD |
-| **rangecode** | rangecoding | Static Range Coding |
-| **zstd** | zstd | Raw Zstandard |
-
+| `fmdelta` | FM-Delta | PCMap + range coding |
+| `xor_zstd` | ZipLLM | XOR delta + Zstandard |
+| `zipnn` | ZipNN | Exponent-bit extraction + Huffman/ZSTD |
+| `rangecode` | Range coding | Static range coding on raw float32 bytes |
+| `zstd` | Zstd | Raw Zstandard |

@@ -98,12 +98,6 @@ import tensor_compress as tc          # noqa: E402
 import modelformat_encodings as _mfe   # noqa: E402
 import fmdelta_encodings as fmd        # noqa: E402
 
-def method_drotl1fmd_encode(base_f32: np.ndarray, ft_f32: np.ndarray) -> bytes:
-    return fmd.drotl1fmd_encode_f32(base_f32.tobytes(), ft_f32.tobytes())
-
-def method_drotl1fmd_decode(encoded: bytes, base_f32: np.ndarray) -> np.ndarray:
-    return np.frombuffer(fmd.drotl1fmd_decode_f32(encoded, base_f32.tobytes()), dtype=np.float32)
-
 def method_fmdelta_encode(base_f32: np.ndarray, ft_f32: np.ndarray) -> bytes:
     return fmd.encode_f32(base_f32.tobytes(), ft_f32.tobytes())
 
@@ -123,6 +117,64 @@ def method_xor_zstd_encode(base_f32: np.ndarray, ft_f32: np.ndarray) -> bytes:
 def method_xor_zstd_decode(encoded: bytes, base_f32: np.ndarray) -> np.ndarray:
     xor_u32 = np.frombuffer(_mfe.decompress("ZSTD", encoded, len(base_f32) * 4), dtype=np.uint32)
     return (base_f32.view(np.uint32) ^ xor_u32).view(np.float32)
+
+
+def _encode_u8_huffman_or_zstd(data: bytes) -> Tuple[int, bytes]:
+    try:
+        return 1, _mfe.tensor_encode(data, _mfe.U8, "HUFFMAN_LUT")
+    except Exception:
+        return 0, _mfe.compress("ZSTD", data, 1)
+
+
+def _decode_u8_huffman_or_zstd(codec_id: int, encoded: bytes, size: int) -> bytes:
+    if codec_id == 1:
+        return _mfe.tensor_decode(encoded, _mfe.U8, "HUFFMAN_LUT", size)
+    return _mfe.decompress("ZSTD", encoded, size)
+
+
+def method_zipnn_encode(base_f32: np.ndarray, ft_f32: np.ndarray) -> bytes:
+    u32 = ft_f32.view(np.uint32)
+    sign_exp = (u32 >> np.uint32(23)).astype(np.uint16)
+    mantissa = (u32 & np.uint32(0x7FFFFF)).astype(np.uint32)
+
+    sign_exp_bytes = sign_exp.tobytes()
+    mantissa_bytes = np.empty((len(u32), 3), dtype=np.uint8)
+    mantissa_bytes[:, 0] = (mantissa & np.uint32(0xFF)).astype(np.uint8)
+    mantissa_bytes[:, 1] = ((mantissa >> np.uint32(8)) & np.uint32(0xFF)).astype(np.uint8)
+    mantissa_bytes[:, 2] = ((mantissa >> np.uint32(16)) & np.uint32(0x7F)).astype(np.uint8)
+    mantissa_raw = mantissa_bytes.tobytes()
+
+    sign_exp_codec, sign_exp_enc = _encode_u8_huffman_or_zstd(sign_exp_bytes)
+    mantissa_enc = _mfe.compress("ZSTD", mantissa_raw, 1)
+
+    header = struct.pack(
+        "<4sQBIQ",
+        b"ZPNN",
+        len(u32),
+        sign_exp_codec,
+        len(sign_exp_enc),
+        len(mantissa_enc),
+    )
+    return header + sign_exp_enc + mantissa_enc
+
+
+def method_zipnn_decode(encoded: bytes, base_f32: np.ndarray) -> np.ndarray:
+    magic, n_elems, sign_exp_codec, sign_exp_len, mantissa_len = struct.unpack("<4sQBIQ", encoded[:25])
+    if magic != b"ZPNN":
+        raise ValueError("invalid ZipNN payload")
+    cursor = 25
+    sign_exp_enc = encoded[cursor:cursor + sign_exp_len]
+    cursor += sign_exp_len
+    mantissa_enc = encoded[cursor:cursor + mantissa_len]
+
+    sign_exp_raw = _decode_u8_huffman_or_zstd(sign_exp_codec, sign_exp_enc, n_elems * 2)
+    mantissa_raw = _mfe.decompress("ZSTD", mantissa_enc, n_elems * 3)
+
+    sign_exp = np.frombuffer(sign_exp_raw, dtype=np.uint16).astype(np.uint32)
+    mantissa_bytes = np.frombuffer(mantissa_raw, dtype=np.uint8).reshape(-1, 3).astype(np.uint32)
+    mantissa = mantissa_bytes[:, 0] | (mantissa_bytes[:, 1] << np.uint32(8)) | (mantissa_bytes[:, 2] << np.uint32(16))
+    u32 = (sign_exp << np.uint32(23)) | mantissa
+    return u32.astype(np.uint32).view(np.float32)
 
 # =====================================================================
 # RangeCode (static range coding on raw float32 bytes, no delta)
@@ -181,24 +233,7 @@ def method_rangecode_decode(encoded: bytes, base_f32: np.ndarray) -> np.ndarray:
     return np.frombuffer(b"".join(out_parts), dtype=np.float32)
 
 
-def method_hybrid_encode(base_f32: np.ndarray, ft_f32: np.ndarray, tensor_category: str) -> bytes:
-    if tensor_category in ("weight", "exp_avg_sq"):
-        return method_fmdelta_encode(base_f32, ft_f32)
-    return method_drotl1fmd_encode(base_f32, ft_f32)
-
-def method_hybrid_decode(encoded: bytes, base_f32: np.ndarray, tensor_category: str) -> np.ndarray:
-    if tensor_category in ("weight", "exp_avg_sq"):
-        return method_fmdelta_decode(encoded, base_f32)
-    return method_drotl1fmd_decode(encoded, base_f32)
-
 COMPRESSION_METHODS = {
-    "hybrid": {
-        "name": "Hybrid",
-        "encode": method_hybrid_encode,
-        "decode": method_hybrid_decode,
-        "requires_base": True,
-        "needs_category": True,
-    },
     "fmdelta": {
         "name": "PCMap+FMDelta",
         "encode": method_fmdelta_encode,
@@ -218,6 +253,13 @@ COMPRESSION_METHODS = {
         "encode": method_xor_zstd_encode,
         "decode": method_xor_zstd_decode,
         "requires_base": True,
+        "needs_category": False,
+    },
+    "zipnn": {
+        "name": "ZipNN",
+        "encode": method_zipnn_encode,
+        "decode": method_zipnn_decode,
+        "requires_base": False,
         "needs_category": False,
     },
     "rangecode": {
