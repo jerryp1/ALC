@@ -1,4 +1,4 @@
-# ALC: Adaptive Lossless Compression for LLM Checkpoints
+# ALC: Adaptive Lossless Compression for LLM Training Checkpoints
 
 ## Requirements
 
