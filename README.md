@@ -1,7 +1,5 @@
 # ALC: Adaptive Lossless Compression for LLM Checkpoints
 
-ALC combines verified BF16 deduplication, per-tensor selection among Direct, FM-Delta* and RotDelta, and a shared tANS backend. Historical checkpoints use reverse-delta chains with optional grouping and pipelined recovery/transmission.
-
 ## Requirements
 
 - Python >= 3.10
