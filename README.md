@@ -1,49 +1,60 @@
-# ALC: an adaptive lossless compression framework for LLM checkpoints.
+# ALC: Adaptive Lossless Compression for LLM Checkpoints
 
-## Environment
+ALC combines verified BF16 deduplication, per-tensor selection among Direct, FM-Delta* and RotDelta, and a shared tANS backend. Historical checkpoints use reverse-delta chains with optional grouping and pipelined recovery/transmission.
 
-- Python ≥ 3.9, NumPy ≥ 1.24, PyTorch ≥ 2.0
-- C++20 compiler (for building the extension)
-- pybind11 (`pip install pybind11`)
-- deepspeed (optional, for optimizer states)
+## Requirements
+
+- Python >= 3.10
+- NumPy >= 1.24
+- PyTorch >= 2.0
+- pybind11 >= 2.10 and a C++20 compiler, for building the extension
+- pkg-config and OpenSSL development headers
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Build C++ Extension
+## Build C++ extension
 
-Pre-built `.so` is included. To rebuild:
-
-```bash
-cd src/cpp
-c++ -O3 -march=native -shared -std=c++20 -fPIC \
-    $(python -m pybind11 --includes) \
-    drotl1fmd_tans_cpp_codec.cpp \
-    -o drotl1fmd_tans_cpp_codec$(python3-config --extension-suffix)
-```
-
-## Usage
+Run from the repository root. Installation automatically compiles `src/cpp/serving_runtime.cpp` (including the tensor codec) into `cpp.alc_tans_cpp_codec` for the active platform.
 
 ```bash
-
-# Compress .pt
-./compress.sh --input /path/to/checkpoint-10/global_step10/mp_rank_00_model_states.pt \
-              --base /path/to/checkpoint-0/global_step0/mp_rank_00_model_states.pt \
-              --output_dir ./compressed
+python -m pip install -e .
 ```
 
+Optional tests:
 
-## Algorithm
+```bash
+python -m pip install -e '.[test]'
+python -m pytest -q
+```
 
-`analyze_strategy()` samples ~64K elements, estimates entropy for three paths, and selects the minimum:
+# Usage
 
-| Path | Transform  |
-|------|-----------|
-| **pcdelta** | `pcmap(ft) − pcmap(base)` → (s,k) symbols + mantissas | 
-| **rotdelta** | `rotl1(ft) − rotl1(base)` → (s,k) symbols + mantissas |
-| **I-Align** | `rotl1(ft)` → 4 byte columns → tANS each | 
+- Compress and restore
 
-All paths use C++ tANS entropy coding. 
+```bash
+# One checkpoint; omit --base for independent Direct compression.
+./compress.sh --input target.pt --base newer.pt --output_dir compressed
+./decompress.sh --input compressed/compressed_target.pt --output_dir restored
 
+# Version history, ordered oldest to newest.
+python examples/synthetic_checkpoints.py --output outputs/example
+./compress.sh --checkpoints outputs/example/checkpoint-*.pt --output outputs/archive
+./decompress.sh --input outputs/archive --version 1 --output outputs/restored.pt
+```
 
+Outputs are **archive directories** containing metadata and references. Version histories default to no grouping, with the newest checkpoint kept Raw. Add `--group_size 4` for grouped serving.
+
+Use `--input_dir` / `--base_dir` for directory batches and `--bf16_pairs mapping.json` for explicit master mappings. Run `./compress.sh --help` or `./decompress.sh --help` for all options.
+
+- Serving
+
+```bash
+# Server and client (separate terminals).
+python serve_checkpoint.py serve outputs/archive --port 9000
+python serve_checkpoint.py fetch --port 9000 --version 1 --output outputs/received.pt
+
+# Local paced query with compressed data preloaded before timing.
+python serve_checkpoint.py query outputs/archive --version 1 --resident
+```

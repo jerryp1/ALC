@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alc-checkpoint"
+version = "0.1.0"
+description = "Adaptive lossless compression and pipelined recovery of training checkpoints"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "torch>=2.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "zstandard>=0.22"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["cpp"]
+py-modules = ["tensor_compress", "tans_codec", "checkpoint_io", "checkpoint_archive", "bf16", "serving", "serving_scheduler", "serving_transport"]
+script-files = ["compress_checkpoint.py", "decompress_checkpoint.py", "serve_checkpoint.py", "compress.sh", "decompress.sh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.isort]
+profile = "black"

@@ -8,7 +8,7 @@ import heapq
 import json
 import math
 
-DEFAULT_TABLE_LOG = 12
+DEFAULT_TABLE_LOG = 8
 MIN_TABLE_LOG = 5
 MAX_TABLE_LOG = 15
 

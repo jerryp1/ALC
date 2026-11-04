@@ -1,0 +1,7 @@
+recursive-include src *.py *.cpp
+prune baseline
+prune docs
+recursive-include examples *.py
+recursive-include tests *.py
+include README.md
+include requirements.txt compress_checkpoint.py decompress_checkpoint.py serve_checkpoint.py compress.sh decompress.sh

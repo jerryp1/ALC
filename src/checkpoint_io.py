@@ -6,15 +6,19 @@ Supports:
   - bf16_zero_pp_rank_*_optim_states.pt (DeepSpeed ZeRO optimizer states)
   - Generic .pt files with tensor dicts
 
-Data types: bf16, fp16, fp32 — all converted to float32 numpy for compression.
+Legacy readers expose FP32 views. Archive extraction below preserves original bits and dtypes.
 """
 
+import hashlib
+import io
 import json
 import os
+import pickle
 import struct
 from collections import OrderedDict
 
 import numpy as np
+import torch
 
 
 class TensorDict(OrderedDict):
@@ -27,6 +31,110 @@ class TensorDict(OrderedDict):
     def add_tensor(self, name, arr_f32, original_dtype, shape):
         self[name] = arr_f32
         self.metadata[name] = {"dtype": original_dtype, "shape": tuple(shape)}
+
+
+def load_pt_checkpoint(filepath):
+    torch = _get_torch()
+    return torch.load(filepath, map_location="cpu", weights_only=False)
+
+
+def save_pt_checkpoint(state, filepath):
+    torch = _get_torch()
+    torch.save(state, filepath, _use_new_zipfile_serialization=True, pickle_protocol=5)
+
+
+def _path_step(kind, key):
+    return {"kind": kind, "key": key}
+
+
+def _display_child(prefix, key, indexed):
+    if indexed:
+        return "%s[%d]" % (prefix, key) if prefix else "[%d]" % key
+    return "%s.%s" % (prefix, key) if prefix else str(key)
+
+
+def iter_tensor_leaves(obj, prefix="", path=None):
+    torch = _get_torch()
+    if path is None:
+        path = []
+
+    if isinstance(obj, torch.Tensor):
+        yield {
+            "name": prefix.rstrip("."),
+            "path": list(path),
+            "tensor": obj,
+            "shape": list(obj.shape),
+            "dtype": _torch_dtype_to_str(obj.dtype),
+            "numel": int(obj.numel()),
+        }
+        return
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child_prefix = _display_child(prefix, key, indexed=False)
+            yield from iter_tensor_leaves(value, child_prefix, path + [_path_step("dict", key)])
+        return
+
+    if isinstance(obj, list):
+        for index, value in enumerate(obj):
+            child_prefix = _display_child(prefix, index, indexed=True)
+            yield from iter_tensor_leaves(value, child_prefix, path + [_path_step("list", index)])
+        return
+
+    if isinstance(obj, tuple):
+        for index, value in enumerate(obj):
+            child_prefix = _display_child(prefix, index, indexed=True)
+            yield from iter_tensor_leaves(value, child_prefix, path + [_path_step("tuple", index)])
+
+
+def get_by_typed_path(obj, path):
+    current = obj
+    for step in path:
+        current = current[step["key"]]
+    return current
+
+
+def set_by_typed_path(obj, path, value):
+    if not path:
+        return value
+
+    step = path[0]
+    key = step["key"]
+    if step["kind"] == "dict":
+        obj[key] = set_by_typed_path(obj[key], path[1:], value)
+        return obj
+    if step["kind"] == "list":
+        obj[key] = set_by_typed_path(obj[key], path[1:], value)
+        return obj
+    if step["kind"] == "tuple":
+        items = list(obj)
+        items[key] = set_by_typed_path(items[key], path[1:], value)
+        return tuple(items)
+    raise ValueError("unknown path step kind: %s" % step["kind"])
+
+
+def tensor_to_float32_array(tensor):
+    return _tensor_to_float32(tensor)
+
+
+def float32_array_to_tensor(arr_f32, dtype_str, shape):
+    torch = _get_torch()
+    shaped = np.asarray(arr_f32, dtype=np.float32).reshape(shape)
+    tensor = torch.from_numpy(shaped.copy())
+    if dtype_str == "BF16":
+        return tensor.to(dtype=torch.bfloat16)
+    if dtype_str == "F16":
+        return tensor.to(dtype=torch.float16)
+    return tensor.to(dtype=torch.float32)
+
+
+def bytes_to_uint8_tensor(data):
+    torch = _get_torch()
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+
+
+def uint8_tensor_to_bytes(tensor):
+    return bytes(tensor.detach().cpu().numpy().tobytes())
 
 
 def _to_float32(raw_bytes, dtype_str, shape):
@@ -53,7 +161,7 @@ def _torch_dtype_to_str(dtype):
         "torch.half": "F16",
     }
     key = str(dtype)
-    return dtype_map.get(key, "F32")
+    return dtype_map.get(key, key)
 
 
 def _tensor_to_float32(tensor):
@@ -150,7 +258,7 @@ def read_pt_optim_states(filepath):
     torch = _get_torch()
 
     try:
-        import deepspeed
+        import deepspeed  # noqa: F401 -- legacy reader requires its pickle classes
         state = torch.load(filepath, map_location="cpu", weights_only=False)
     except ImportError:
         state = _load_pt_safe(filepath)
@@ -235,9 +343,9 @@ def _extract_tensor_dict(state):
 
 def _load_pt_safe(filepath):
     """Load a .pt file without requiring custom classes (e.g., deepspeed)."""
+    import io
     import pickle
     import zipfile
-    import io
 
     torch = _get_torch()
 
@@ -300,3 +408,116 @@ def discover_checkpoints(directory):
             elif fname.endswith(".pt") or fname.endswith(".pth"):
                 results.append((fpath, "other"))
     return results
+
+
+# Bit-preserving archive metadata and tensor interface.
+
+def raw_view(tensor):
+    if (
+        type(tensor) not in (torch.Tensor, torch.nn.Parameter)
+        or tensor.layout != torch.strided
+        or tensor.is_quantized
+    ):
+        raise ValueError("ALC currently supports dense, unquantized tensors")
+    array = (
+        tensor.detach()
+        .cpu()
+        .resolve_conj()
+        .resolve_neg()
+        .contiguous()
+        .reshape(-1)
+        .view(torch.uint8)
+        .numpy()
+    )
+    return memoryview(array).cast("B")
+
+
+def array(tensor):
+    safe = tensor.detach().cpu().contiguous().reshape(-1)
+    if tensor.dtype == torch.bfloat16:
+        return safe.view(torch.int16).numpy().view(np.uint16)
+    if tensor.dtype in (torch.float32, torch.float64):
+        return safe.numpy()
+    return np.frombuffer(raw_view(safe), np.uint8)
+
+
+def extract(state, hash_tensors=True):
+    entries, by_object, containers = {}, {}, set()
+
+    def register(tensor, path):
+        if id(tensor) in by_object:
+            return by_object[id(tensor)]
+        raw = raw_view(tensor)
+        key = hashlib.sha256(pickle.dumps(path, protocol=4)).hexdigest()
+        spec = {
+            "key": key,
+            "name": ".".join(str(x[1]) for x in path) or "tensor",
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+            "shape": list(tensor.shape),
+            "numel": tensor.numel(),
+            "original_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest() if hash_tensors else None,
+            "requires_grad": tensor.requires_grad,
+            "parameter": isinstance(tensor, torch.nn.Parameter),
+        }
+        entries[key] = {"spec": spec, "tensor": tensor, "path": path}
+        by_object[id(tensor)] = key
+        return key
+
+    def walk(obj, path):
+        if isinstance(obj, torch.Tensor):
+            register(obj, path)
+        elif isinstance(obj, (dict, list, tuple)) and id(obj) not in containers:
+            containers.add(id(obj))
+            children = obj.items() if isinstance(obj, dict) else enumerate(obj)
+            for key, value in children:
+                walk(
+                    value,
+                    path + [("dict" if isinstance(obj, dict) else "sequence", key)],
+                )
+
+    walk(state, [])
+
+    class Writer(pickle.Pickler):
+        def persistent_id(self, obj):
+            if isinstance(obj, torch.Tensor):
+                key = by_object.get(id(obj))
+                if key is None:
+                    key = register(obj, [("object_tensor", len(entries))])
+                return ("ALC_TENSOR", key)
+            return None
+
+    output = io.BytesIO()
+    Writer(output, protocol=5).dump(state)
+    return output.getvalue(), entries
+
+
+def rebuild(template, load_tensor):
+    class Reader(pickle.Unpickler):
+        def persistent_load(self, reference):
+            if (
+                not isinstance(reference, tuple)
+                or len(reference) != 2
+                or reference[0] != "ALC_TENSOR"
+            ):
+                raise ValueError("Invalid tensor metadata reference")
+            return load_tensor(reference[1])
+
+    return Reader(io.BytesIO(template)).load()
+
+
+def from_bytes(data, spec):
+    dtype = getattr(torch, spec["dtype"])
+    if len(data) != spec["original_bytes"]:
+        raise ValueError("Tensor byte count mismatch")
+    storage = data if isinstance(data, bytearray) else bytearray(data)
+    tensor = (
+        torch.frombuffer(storage, dtype=dtype).reshape(spec["shape"])
+        if data
+        else torch.empty(spec["shape"], dtype=dtype)
+    )
+    if spec["parameter"]:
+        return torch.nn.Parameter(tensor, requires_grad=spec["requires_grad"])
+    if spec["requires_grad"]:
+        tensor.requires_grad_(True)
+    return tensor
