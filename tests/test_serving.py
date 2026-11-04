@@ -123,7 +123,7 @@ def test_cli_example_archive_restore_and_tcp_fetch(tmp_path):
     subprocess.run(
         [
             sys.executable,
-            str(root / "examples/synthetic_checkpoints.py"),
+            str(root / "src/synthetic_checkpoints.py"),
             "--output",
             str(inputs),
         ],

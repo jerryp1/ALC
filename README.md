@@ -37,7 +37,7 @@ python -m pytest -q
 ./decompress.sh --input compressed/compressed_target.pt --output_dir restored
 
 # Version history, ordered oldest to newest.
-python examples/synthetic_checkpoints.py --output outputs/example
+python src/synthetic_checkpoints.py --output outputs/example
 ./compress.sh --checkpoints outputs/example/checkpoint-*.pt --output outputs/archive
 ./decompress.sh --input outputs/archive --version 1 --output outputs/restored.pt
 ```
